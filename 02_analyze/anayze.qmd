@@ -1,0 +1,209 @@
+---
+title: "OHRV"
+format: html
+editor: visual
+execute: 
+  echo: true
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+library(tidyverse)
+
+review_tbl <- read_rds("00_data/Tour_info_review_final_tbl.rds")
+```
+
+Questions: What affects tour ratings?
+
+1. Description to test the tour characteristics.
+2. Price
+3. Pricing per person vs group
+4. Duration
+5. Operators
+
+
+```{r}
+glimpse(review_tbl)
+
+skimr::skim(review_tbl)
+skimr::skim(review_tbl %>% unnest(Review_info))
+```
+
+# Clean data
+
+1. length: convert minutes to hour and then convert to number
+2. select variables to examine: Tour_names, reviewer, review, Description, Price, Price_per, Length, Operators, tour_rating, Rankings, n_reviews
+3. description: two tours with the same description?
+4. duplicate reviews: hired by tour operators?
+5. tour_name: delete b/c it's redundant
+6. price: convert group rates to per-person rates
+
+```{r}
+review_unnested_tbl <- review_tbl %>%
+    
+    # Convert all prices to the per-person rate, assuming the avg number of adults per group is 3
+    mutate(Price_per_person = if_else(Price_per == "per group", Price / 3, Price)) %>%
+    
+    # Convert all tour lengths to the hour-basis. Some are reported in minutes 
+    mutate(Length_hour = parse_number(Length),
+           Length_hour = if_else(str_detect(Length, "min"), Length_hour/60, Length_hour))  %>%
+    
+    # Unnest reviews
+    unnest(Review_info) %>%
+    select(Tour_names, tour_rating, Rankings, Price_per_person, Price_per, 
+           Length_hour, Operators, n_reviews, Description, reviewer, review)
+
+# Check for duplicate reviews    
+review_unnested_tbl %>%
+    
+    group_by(review) %>%
+    summarise(n_review = n()) %>%
+    ungroup() %>%
+    
+    filter(n_review > 1) %>% 
+    arrange(-n_review) %>%
+    
+    left_join(review_unnested_tbl, by = "review") %>%
+    select(reviewer, n_review, review)
+
+review_clean_tbl <- review_unnested_tbl %>%
+    
+    # Remove NAs in reviews
+    filter(!is.na(review)) %>%
+    
+    # Remove duplicate reviews
+    distinct()
+
+```
+
+# Explore data
+
+```{r}
+skimr::skim(review_clean_tbl)
+
+review_clean_tbl %>%
+    count(tour_rating)
+
+info_averaged_by_tour_tbl <- review_clean_tbl %>%
+    
+    group_by(Tour_names, Price_per_person, Rankings, Price_per, Length_hour, n_reviews) %>%
+    summarise(avg_rating = mean(tour_rating)) %>%
+    ungroup() 
+
+info_averaged_by_tour_tbl %>%
+        ggplot(aes(avg_rating)) +
+    geom_histogram()
+
+info_averaged_by_tour_tbl %>%
+    ggplot(aes(Price_per_person, avg_rating)) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "loess", span = 1)
+
+info_averaged_by_tour_tbl %>%
+    ggplot(aes(Length_hour)) +
+    geom_histogram() 
+
+info_averaged_by_tour_tbl %>%
+    ggplot(aes(Length_hour, avg_rating)) +
+    geom_jitter(alpha = 0.5) +
+    geom_smooth(method = "loess", span = 1)
+
+
+
+```
+
+Correlation analysis
+```{r}
+library(correlationfunnel)
+
+info_averaged_by_tour_tbl %>%
+    mutate(avg_rating = if_else(avg_rating > 4.85, "good", "bad")) %>%
+    select(-Tour_names, - Rankings) %>%
+    binarize(n_bins = 4, thresh_infreq = 0.01) %>%
+    correlate(target = avg_rating__good) %>%
+    plot_correlation_funnel()
+```
+
+# Word correlation
+
+```{r}
+library(tidytext)
+library(widyr)
+
+set.seed(2345)
+
+review_tokenized <- review_unnested_tbl %>%
+    filter(!is.na(tour_rating)) %>%
+    
+    # Generate a stratefied sample
+    group_by(tour_rating) %>%
+    sample_n(233) %>%         # rating of 2 is the smallest category with 233
+    ungroup() %>%
+    # Create a unique id for reviews
+    mutate(review_id = row_number()) %>%
+    
+    unnest_tokens(word, review) %>%
+    anti_join(stop_words, by = "word") %>%
+    filter(!word %in% c("tour", "company", "recommend")) %>%
+    filter(str_detect(word, "[a-z]")) 
+
+review_words <- review_tokenized %>%
+    group_by(word) %>%
+    summarise(number = n(),                   # simple word count
+              reviews = n_distinct(review_id), # word count per review
+              avg_rating = mean(tour_rating)) %>%
+    arrange(-reviews)
+
+reviews_filtered <- review_words %>%
+    filter(reviews < 500, reviews > 80)
+
+library(widyr)
+
+word_cors <- review_tokenized %>%
+    
+    # Remove words that are too common and least frequent
+    semi_join(reviews_filtered, by = "word") %>%
+    distinct(review_id, word) %>%
+    pairwise_cor(word, review_id, sort = TRUE)
+
+word_cors
+```
+
+
+```{r}
+library(ggraph)
+library(igraph)
+
+set.seed(1234)
+filtered_cors <- word_cors %>%
+    head(250) 
+
+nodes <- reviews_filtered %>%
+    filter(word %in% filtered_cors$item1 | word %in% filtered_cors$item2)
+
+filtered_cors %>%
+    graph_from_data_frame(vertices = nodes) %>%
+    ggraph() +
+    geom_edge_link() +
+    geom_node_point(aes(size = reviews * 1.1)) +
+    geom_node_point(aes(size = reviews, color = avg_rating)) +
+    scale_color_gradient2(high = "blue", 
+                          low = "red", 
+                          midpoint = nodes %>% summarise(median(avg_rating)) %>% pull()) +
+    geom_node_text(aes(label = name), repel = TRUE) +
+    theme_void() +
+    labs(color = "Average rating",
+         size = "# of reviews",
+         title = "Network of words used in ATV Tour Reviews",
+         subtitle = "Based on the scraped data from tripadvisor.com")
+```
+
+
+```{r}
+word_cors %>%
+    filter(item1 == "money")
+```
+

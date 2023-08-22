@@ -1,0 +1,79 @@
+---
+title: "Map"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up
+
+```{r}
+library(tidyverse)
+library(plotly)
+
+detailed_info_clean_tbl <- read_rds("../00_data/data_wrangled/detailed_info_clean_tbl.rds")
+info_averaged_by_tour_tbl <- read_rds("../00_data/data_wrangled/info_averaged_by_tour_tbl.rds")
+
+data <- detailed_info_clean_tbl %>% 
+    left_join(info_averaged_by_tour_tbl,
+              by = c("name" = "Tour_names")) %>%
+    janitor::clean_names() %>%
+    
+    # Add hover text
+    mutate(hover = paste0("<b>",name %>% str_remove_all("[0-9]*\\. "),"</b>", "\n", 
+                          "<b>Average Rating: </b>", avg_rating %>% round(2),"<br>", "\n",
+                          "<b>Duration in hours:</b>   ", length_hour, "\n",
+                          "<b>Price per adult:</b>   $", price_per_person, "\n",
+                          "<b>Full refund?</b>   ", full_refund, "\n",
+                          "<b>Include water/beverages?:</b>   ", include_water_or_beverages, "\n",
+                          "<b>Not include gratuities?</b>   ", not_include_gratuities, "\n",
+                          "<b>Service animals allowed?</b>   ", access_service_animals_allowed, "\n",
+                          "<b>Include guide?</b>   ", include_guide, "\n",
+                          "<b>Near public transportation?</b>   ", access_near_public_transportation, "\n",
+                          "<b>Include entry/admission?:</b>   ", include_entry_admission, "\n",
+                          "<b>Include pick up drop off?</b>   ", include_pick_up_drop_off, "\n",
+                          "<b>Stroller accessible?</b>   ", access_stroller_accessible, "\n",
+                          "<b>Include taxes?:</b>   ", include_taxes, "\n",
+                          "<b>Include lunch or snacks?</b>   ", include_lunch_or_snacks, "\n",
+                          "<b>Include helmets?:</b>   ", include_helmets, "\n",
+                          "<b>Infant allowed?:</b>   ", access_infant_allowed, "\n",
+                          "<b>Wheelchair accessible?</b>   ", access_wheelchair_accessible))
+```
+
+# Map
+
+```{r}
+geo_properties <- list(
+    scope = "usa",
+    projection = list(type = 'albers usa'),
+    showland = TRUE,
+    showsubunits = TRUE,
+    landcolor = toRGB("gray10"),
+    showlakes = TRUE,
+    lakecolor = toRGB("white")
+)
+
+
+map <- plot_geo(data) %>%
+    add_markers(
+        x = ~longitude,
+        y = ~latitude,
+        color = ~avg_rating,
+        colors ='RdBu',
+        text = ~hover,
+        hoverinfo = "text",
+        marker = list(
+          symbol = "circle",
+          size = 8,
+          line = list(color = "black", width = 1),
+          opacity = 0.8
+        )
+      ) %>%
+    layout(geo = geo_properties)
+
+# Display the map
+map
+
+write_rds(map, "../00_data/fig/map.rds")
+```

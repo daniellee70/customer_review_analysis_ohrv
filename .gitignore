@@ -3,5 +3,9 @@
 .RData
 .Ruserdata
 00_data/
+02_analyze/analyze_detailed_info_files
+02_analyze/analyze_lemma_files
+02_analyze/english-ewt-ud-2.5-191206.udpipe
+02_analyze/map_files
 03_modeling/
 04_communicate/

@@ -1,0 +1,119 @@
+---
+title: "OHRV"
+format: html
+editor: visual
+execute: 
+  echo: true
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+
+detailed_info_clean_tbl <- read_rds("../00_data/data_wrangled/detailed_info_clean_tbl.rds")
+info_averaged_by_tour_tbl <- read_rds("../00_data/data_wrangled/info_averaged_by_tour_tbl.rds")
+
+data <- 
+    left_join(info_averaged_by_tour_tbl, detailed_info_clean_tbl, by = c("Tour_names" = "name")) %>%
+    select(-latitude, -longitude)
+```
+
+Questions: What affects tour ratings?
+
+1.  
+
+```{r}
+glimpse(data)
+
+```
+
+# Explore data
+
+## common characteristics
+
+```{r}
+skimr::skim(data)
+
+plot_data <- data %>%
+    select(Tour_names, avg_rating, include_guide:not_include_gratuities, full_refund:access_infant_allowed) %>%
+    pivot_longer(cols =  c(-Tour_names, -avg_rating), names_to = "category", values_to = "Value") %>%
+    count(category, Value) %>%
+    filter(Value == "yes") %>% 
+    select(-Value) %>%
+    mutate(category = str_remove(category, "access_"))
+
+library(tidyquant)
+counts_of_char_fig <- plot_data %>%
+    ggplot(aes(n, fct_reorder(category, n))) +
+    geom_col(fill = "cornflowerblue") +
+    labs(title = "Common Characteristics of ATV Tours",
+         subtitle = "Of 110 ATV Tours from tripadvisor.com",
+         x = "Number of ATV Tours",
+         y = NULL) +
+    scale_fill_tq() +
+    theme_tq() +
+    geom_text(aes(label = n), hjust = 1.5)
+
+counts_of_char_fig
+
+write_rds(counts_of_char_fig, "../00_data/fig/counts_of_char_fig.rds")
+```
+
+```{r}
+data %>%
+    select(Tour_names, avg_rating, include_guide:access_infant_allowed) %>%
+    pivot_longer(cols = c(-Tour_names, -avg_rating), names_to = "category", values_to = "value") %>%
+    
+    ggplot(aes(value, avg_rating)) +
+    geom_boxplot() +
+    facet_wrap(~category)
+```
+
+```{r}
+ratings_and_tour_char_fig <- data %>%
+    select(Tour_names, avg_rating, include_guide:not_include_gratuities, full_refund:access_infant_allowed) %>%
+    pivot_longer(cols = c(-Tour_names, -avg_rating), names_to = "category", values_to = "value") %>%
+    
+    ggplot(aes(value, avg_rating, color = value)) +
+    geom_boxplot(outlier.shape = 1, outlier.color = "black", outlier.size = 2) +
+    geom_jitter(width = 0.2, alpha = 0.3) +
+    facet_wrap(~category, ncol = 3) +
+    
+    theme_tq() +
+    scale_color_tq() +
+    theme(legend.position = "none") +
+    
+    labs(title = "Correlations between Ratings and ATV Tour Characteristics",
+         subtitle = "110 ATV tours from tripadvisor.com",
+         y = "Average Ratings", x = NULL)
+
+ratings_and_tour_char_fig
+
+write_rds(ratings_and_tour_char_fig, "../00_data/fig/ratings_and_tour_char_fig.rds")
+```
+
+## Corr between characteristics and average ratings
+
+```{r}
+data %>% slice(0) %>% glimpse()
+
+library(correlationfunnel)
+
+data %>%
+    mutate(avg_rating = if_else(avg_rating > 4.85, "good", "bad")) %>%
+    select(-Tour_names, - Rankings) %>%
+    binarize(n_bins = 4, thresh_infreq = 0.01) %>%
+    correlate(target = avg_rating__good) %>%
+    plot_correlation_funnel()
+```
+
+```{r}
+library(broom)
+
+data %>%
+    lm(avg_rating ~ Price_per_person + full_refund, data = .) %>%
+    summary() %>%
+    tidy()
+```
