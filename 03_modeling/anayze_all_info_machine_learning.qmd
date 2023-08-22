@@ -1,0 +1,228 @@
+---
+title: "OHRV"
+format: html
+editor: visual
+execute: 
+  echo: true
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+
+detailed_info_clean_tbl <- read_rds("../00_data/data_wrangled/detailed_info_clean_tbl.rds")
+review_tbl <- read_rds("../00_data/data_scraped/Tour_info_review_final_tbl.rds")
+
+
+```
+
+# Clean data
+
+```{r}
+data <- 
+    left_join(review_tbl, detailed_info_clean_tbl, by = c("Tour_names" = "name")) %>%
+    select(-latitude, -longitude) %>%
+    
+    # Convert all prices to the per-person rate, assuming the avg number of adults per group is 3
+    mutate(Price_per_person = if_else(Price_per == "per group", NA, Price)) %>%
+    
+    # Convert all tour lengths to the hour-basis. Some are reported in minutes 
+    mutate(Length_hour = parse_number(Length),
+           Length_hour = if_else(str_detect(Length, "min"), Length_hour/60, Length_hour))  %>%
+    
+    # Unnest reviews
+    unnest(Review_info) %>%
+    select(-name, -tour_name, -page, -value, - Review_links, -Rankings, -Length, -Price, 
+           -not_include_guide, -not_include_water_or_beverages, -not_include_lunch_or_snacks, 
+           -not_include_pick_up_drop_off, -not_include_entry_admission) %>%
+    janitor::clean_names() %>%
+    
+    # Remove 5 missing values 
+    filter(!is.na(tour_rating)) %>%
+    filter(!is.na(price_per_person)) %>%
+    
+    # Convert rating to a categorical variable: 
+    # people perceive 4 or higher as good on a scale of 1-5
+    mutate(tour_rating_cat = if_else(tour_rating >= 4, "good", "bad")) %>%
+    
+    # Convert to factor
+    mutate(price_per = as.factor(price_per),
+           tour_rating_cat = as.factor(tour_rating_cat))
+
+glimpse(data)
+
+```
+
+```{r}
+data_long <- data %>%
+    pivot_longer(cols = c(starts_with("include"), starts_with("access"),
+                          not_include_gratuities, full_refund), 
+                 names_to = "category", 
+                 values_to = "value") %>%
+    
+    # Convert to factor
+    mutate(category = as.factor(category))
+```
+
+# Explore data
+
+## common characteristics
+
+```{r}
+skimr::skim(data)
+
+data %>%
+    ggplot(aes(tour_rating)) +
+    geom_histogram()
+```
+
+```{r}
+library(explore)
+
+# data %>% explore()
+# data_long %>% explore()
+```
+
+# Split data
+
+```{r}
+library(tidymodels)
+
+set.seed(123)
+
+data_split <- initial_split(data, strata = tour_rating_cat)
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+dim(data_train)
+dim(data_test)
+
+
+# Create resampling folds using vfold_cv
+folds <- vfold_cv(data_train, strata = tour_rating_cat)
+```
+
+# Preprocess data
+
+```{r}
+library(textrecipes)
+library(themis)
+
+data_rec <- data_train %>%
+  recipe(tour_rating_cat ~ .) %>%
+  update_role(tour_names, new_role = "id") %>%
+  step_rm(tour_rating, description, operators, reviewer, price_per) %>%
+  step_tokenize(review) %>%
+  step_stopwords(review)%>%
+  step_tokenfilter(review, max_tokens = 100) %>%
+  step_tf(review) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_smote(tour_rating_cat)
+
+data_rec %>% prep() %>% bake(new_data = NULL) %>% glimpse()
+```
+
+# Build models
+
+```{r}
+# Define the XGBoost model
+xgb_model <- boost_tree(
+  trees = tune(),
+  mtry = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# Create the workflow
+xgb_wf <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(data_rec)
+
+# Define the search grid for tuning hyperparameters
+# param_grid <- grid_random(
+#   mtry(),
+#   learn_rate(),
+#   size = 10
+# )
+
+doParallel::registerDoParallel()
+
+# Tune the XGBoost model
+xgb_tune <- tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid = 5
+)
+
+
+
+```
+
+# Evaluate models
+
+```{r}
+# Get the best XGBoost model based on tuning results
+collect_metrics(xgb_tune)
+show_best(xgb_tune)
+best_xgb <- select_best(xgb_tune, metric = "accuracy")
+
+# Fit the best XGBoost model to the entire training data
+final_wf <- finalize_workflow(xgb_wf, best_xgb)
+
+final_fit <- final_wf %>% last_fit(data_split)
+
+final_fit %>%
+  collect_metrics()
+
+final_fit %>%
+  collect_predictions() %>% 
+  roc_curve(tour_rating_cat, .pred_bad) %>% 
+  autoplot()
+
+library(vip)
+
+extract_fit_parsnip(final_fit) %>%
+    vip(geom = "point", num_features = 30)
+```
+
+# Predict
+
+```{r}
+# Save the model
+final_wf <- extract_workflow(final_fit)
+write_rds(final_wf, "models/final_wf_xgboost.rds")
+
+final_wf <- read_rds("models/final_wf_xgboost.rds")
+
+# Make predictions on the test set
+predictions <- predict(final_wf, data_test)
+
+# Calculate the probability of having a good review >= 4 
+# when a review has 'knowledgeable and friendly guide'
+data_test %>% filter(str_detect(review, "guide")) %>% filter(tour_rating < 4)
+data_test %>% filter(str_detect(review, "Our tour guide kept saying"))
+data_test[4860,]
+predict(final_wf, data_test[4860,], type = "prob") # prob of good 0.268
+
+# See how much the probability of getting a good review changes 
+# after replacing "Our guide was knowledgeable and friendly."
+data_replaced <- data_test[4860,]
+data_replaced$review <- "Our guide was knowledgeable and friendly."
+predict(final_wf, data_replaced, type = "prob") # prob of good 0.999
+
+
+
+# Evaluate the model performance
+accuracy <- accuracy(predictions, data_test$tour_rating_cat)
+confusion_matrix <- confusion_matrix(predictions, data_test$tour_rating_cat)
+
+# Print the evaluation metrics
+cat("Accuracy:", accuracy, "\n")
+print(confusion_matrix)
+
+```

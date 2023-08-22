@@ -1,0 +1,196 @@
+---
+title: "OHRV"
+format: html
+editor: visual
+execute: 
+  echo: true
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+
+detailed_info_clean_tbl <- read_rds("../00_data/data_wrangled/detailed_info_clean_tbl.rds")
+info_averaged_by_tour_tbl <- read_rds("../00_data/data_wrangled/info_averaged_by_tour_tbl.rds")
+# review_tbl <- read_rds("../00_data/data_scraped/Tour_info_review_final_tbl.rds")
+
+
+```
+
+# Clean data
+
+```{r}
+data <- 
+    left_join(info_averaged_by_tour_tbl, detailed_info_clean_tbl, by = c("Tour_names" = "name")) %>%
+    select(-latitude, -longitude) %>%
+    
+    select(-Rankings, -Price, 
+           -not_include_guide, -not_include_water_or_beverages, -not_include_lunch_or_snacks, 
+           -not_include_pick_up_drop_off, -not_include_entry_admission) %>%
+    janitor::clean_names() %>%
+
+    # Convert rating to a categorical variable
+    mutate(avg_rating_cat = if_else(avg_rating > 4, "good", "bad")) %>%
+    
+    # Convert to factor
+    mutate(price_per = as.factor(price_per),
+           avg_rating_cat = as.factor(avg_rating_cat))
+
+glimpse(data)
+
+```
+
+# Explore data
+
+## common characteristics
+
+```{r}
+skimr::skim(data)
+
+data %>%
+    ggplot(aes(avg_rating)) +
+    geom_histogram()
+```
+
+```{r}
+library(explore)
+
+# data %>% explore()
+# data_long %>% explore()
+```
+
+# Split data
+
+```{r}
+library(tidymodels)
+
+set.seed(123)
+
+data_split <- initial_split(data, strata = avg_rating_cat)
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+dim(data_train)
+dim(data_test)
+
+
+# Create resampling folds using vfold_cv
+folds <- vfold_cv(data_train, strata = avg_rating_cat)
+```
+
+# Preprocess data
+
+```{r}
+library(textrecipes)
+library(themis)
+
+data_rec <- data_train %>%
+  recipe(avg_rating_cat ~ .) %>%
+  update_role(tour_names, new_role = "id") %>%
+  step_rm(avg_rating) %>%
+  step_impute_knn(price_per_person) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors())
+
+data_rec %>% prep() %>% bake(new_data = NULL) %>% glimpse()
+```
+
+# Classification
+
+```{r}
+# Define the XGBoost model
+xgb_model <- boost_tree(
+  trees = tune(),
+  mtry = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# Create the workflow
+xgb_wf <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(data_rec)
+
+# Define the search grid for tuning hyperparameters
+# param_grid <- grid_random(
+#   mtry(),
+#   learn_rate(),
+#   size = 10
+# )
+
+doParallel::registerDoParallel()
+
+# Tune the XGBoost model
+xgb_tune <- tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid = 20
+)
+
+
+```
+
+```{r eval=F}
+library(finetune)
+doParallel::registerDoParallel()
+
+set.seed(234)
+xgb_tune <-
+  tune_race_anova(
+    xgb_wf,
+    folds,
+    grid = 20,
+    control = control_race(verbose_elim = TRUE)
+  )
+
+xgb_tune
+```
+
+# Evaluate models
+
+```{r}
+# Get the best XGBoost model based on tuning results
+collect_metrics(xgb_tune)
+show_best(xgb_tune)
+best_xgb <- select_best(xgb_tune, metric = "roc_auc")
+
+# Fit the best XGBoost model to the entire training data
+final_wf <- finalize_workflow(xgb_wf, best_xgb)
+
+final_fit <- final_wf %>% last_fit(data_split)
+
+final_fit %>%
+  collect_metrics()
+
+# final_fit %>%
+#   collect_predictions() %>% 
+#   roc_curve(avg_rating, .pred_bad) %>% 
+#   autoplot()
+
+library(vip)
+
+extract_fit_parsnip(final_fit) %>%
+    vip(geom = "point", num_features = 12)
+
+```
+
+# Predict
+
+```{r eval=F}
+
+# Make predictions on the test set
+predictions <- predict(extract_workflow(final_fit), data_test)
+
+# Evaluate the model performance
+accuracy <- accuracy(predictions, data_test$avg_rating_cat)
+confusion_matrix <- confusion_matrix(predictions, data_test$avg_rating_cat)
+
+# Print the evaluation metrics
+cat("Accuracy:", accuracy, "\n")
+print(confusion_matrix)
+
+```
